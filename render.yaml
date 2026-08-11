@@ -1,0 +1,33 @@
+# Render deployment configuration.
+#
+# Committing this means the deployment is described in the repository rather
+# than only existing as clicks in a dashboard, so it can be reviewed and
+# recreated.
+#
+# The two secrets use `sync: false`, which tells Render to ask for the value in
+# the dashboard instead of reading it from this file. Secrets never belong in
+# version control.
+
+services:
+  - type: web
+    name: skills-agent-platform
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+
+    # Render calls this to decide whether the container came up correctly.
+    healthCheckPath: /api/health
+
+    envVars:
+      # Set these in the Render dashboard - they are never stored in the repo.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+
+      # Safe to keep here: not secret.
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: LOG_LEVEL
+        value: INFO

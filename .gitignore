@@ -3,6 +3,20 @@
 *.env
 !.env.example
 
+# Scratch files people keep credentials in. Belt and braces: the real rule is
+# "keep credentials outside the repo folder", but these patterns mean a stray
+# `git add -A` cannot pick them up by accident.
+keys
+keys.*
+secrets
+secrets.*
+credentials
+credentials.*
+*.key
+*.pem
+token.txt
+notes-private.*
+
 # Python
 __pycache__/
 *.py[cod]
