@@ -8,7 +8,10 @@ a skill runs, an agent works through it using only the tools that skill was
 granted — and any action that changes data stops and waits for a human to
 approve it.
 
-**Live application:** _(deployed on Render — see [Deployment](#deployment))_
+**Live application:** <https://skills-agent-platform.onrender.com>
+
+> Hosted on a free tier. If the page takes a moment on first load, the container
+> is waking up.
 
 ---
 
