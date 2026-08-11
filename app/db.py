@@ -9,12 +9,19 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import DATABASE_URL
 
+# Some hosts hand out connection strings beginning with "postgres://", which
+# SQLAlchemy refuses. The two are the same thing, so normalise it rather than
+# making whoever deploys this debug a confusing error.
+database_url = DATABASE_URL
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
 # SQLite needs one extra flag because FastAPI may touch the connection from
 # different threads. Postgres does not need it, so we only add it for SQLite.
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
 
 engine = create_engine(
-    DATABASE_URL,
+    database_url,
     connect_args=connect_args,
     # Re-check connections before using them. Neon closes idle connections,
     # and without this the first request after a quiet period would fail.
