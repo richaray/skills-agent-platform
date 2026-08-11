@@ -1,0 +1,27 @@
+# Secrets - never commit these
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Local database file (we use SQLite locally, Postgres in production)
+*.db
+*.sqlite3
+
+# Frontend
+node_modules/
+frontend/dist/
+app/static/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
