@@ -101,6 +101,7 @@ def health():
         "status": "ok",
         "llm_configured": config.llm_is_configured(),
         "model": config.GEMINI_MODEL,
+        "model_chain": config.model_chain(),
     }
 
 

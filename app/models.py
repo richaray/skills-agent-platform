@@ -53,7 +53,14 @@ EXECUTION_STATUSES = [
     "max_steps_exceeded",  # hit the step limit without finishing
 ]
 
-STEP_KINDS = ["llm_call", "tool_call", "approval", "final_output", "error"]
+STEP_KINDS = [
+    "llm_call",
+    "tool_call",
+    "approval",
+    "final_output",
+    "invalid_output",  # a final answer we rejected and asked the model to redo
+    "error",
+]
 
 APPROVAL_STATUSES = ["pending", "approved", "rejected"]
 
@@ -188,6 +195,17 @@ class ExecutionStep(Base):
     tool_name = Column(String(80), nullable=True)
     tool_input = Column(JSON, nullable=True)
     tool_output = Column(JSON, nullable=True)
+
+    # The provider's reply for this step, stored exactly as it arrived.
+    #
+    # We rebuild the conversation from these rows on every turn, and modern
+    # models attach data to their replies that must come back unchanged - Gemini
+    # 3 signs its reasoning with a `thoughtSignature` and rejects the request if
+    # the signature does not return with the tool call it belongs to. It also
+    # omits that signature sometimes, so reconstructing the turn from our own
+    # fields is guesswork. Replaying the original content verbatim is both
+    # simpler and always correct.
+    model_content = Column(JSON, nullable=True)
 
     error_message = Column(Text, nullable=True)
     duration_ms = Column(Integer, nullable=True)

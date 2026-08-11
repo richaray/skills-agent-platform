@@ -8,6 +8,9 @@ import type { Execution, ExecutionStep } from "../types";
 /** Picks the left-border colour and heading for one step in the timeline. */
 function describeStep(step: ExecutionStep): { className: string; title: string } {
   if (step.kind === "final_output") return { className: "step-final", title: "Final answer" };
+  if (step.kind === "invalid_output") {
+    return { className: "step-approval", title: "Answer rejected — asked the model to redo it" };
+  }
   if (step.kind === "error") return { className: "step-error", title: "Error" };
   if (step.kind === "tool_call") {
     if (step.error_message) {

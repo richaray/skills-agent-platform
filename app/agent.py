@@ -1,4 +1,4 @@
-"""
+﻿"""
 The agent loop.
 
 This is the core of the platform. One run of a skill works like this:
@@ -43,6 +43,11 @@ from app.models import utcnow
 
 class AgentError(Exception):
     """Something went wrong that should stop the run."""
+
+
+# How many times the model may be asked to fix a malformed final answer before
+# we give up on the run.
+MAX_OUTPUT_CORRECTIONS = 2
 
 
 # --- building the prompt -----------------------------------------------------
@@ -117,23 +122,46 @@ def build_contents(execution: models.Execution) -> list[dict]:
     ]
 
     for step in execution.steps:
+        # A rejected final answer: replay what the model said, then the
+        # correction we gave it, so it can see what went wrong.
+        if step.kind == "invalid_output":
+            if step.model_content:
+                contents.append(step.model_content)
+            elif step.llm_text:
+                contents.append({"role": "model", "parts": [{"text": step.llm_text}]})
+
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": step.error_message or "That output could not be used."}
+                    ],
+                }
+            )
+            continue
+
         if step.kind != "tool_call":
             continue
 
-        # What the model asked for.
-        contents.append(
-            {
-                "role": "model",
-                "parts": [
-                    {
-                        "functionCall": {
-                            "name": step.tool_name,
-                            "args": step.tool_input or {},
+        # What the model asked for, replayed exactly as the provider sent it.
+        # Older rows, or a provider that returned nothing usable, fall back to
+        # rebuilding the call from the fields we stored.
+        if step.model_content:
+            contents.append(step.model_content)
+        else:
+            contents.append(
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": step.tool_name,
+                                "args": step.tool_input or {},
+                            }
                         }
-                    }
-                ],
-            }
-        )
+                    ],
+                }
+            )
 
         # What actually happened. Errors and refusals go back to the model as
         # data, so it can recover instead of the whole run dying.
@@ -337,54 +365,72 @@ def run_execution(db: Session, execution: models.Execution) -> models.Execution:
 
         # --- the model gave a final answer ---
         if not reply.tool_name:
+            problem: str | None = None
             parsed = _extract_json(reply.text)
 
             if parsed is None:
+                problem = (
+                    "That reply was not valid JSON. Reply with ONLY a JSON object "
+                    "matching the required output schema, and no text around it."
+                )
+            else:
+                schema = version.output_schema or {}
+                if schema:
+                    try:
+                        jsonschema.validate(instance=parsed, schema=schema)
+                    except jsonschema.ValidationError as exc:
+                        problem = (
+                            "That JSON did not match the required output schema: "
+                            f"{exc.message}. Fix it and reply with ONLY the JSON object."
+                        )
+
+            if problem is None:
                 _record_step(
                     db,
                     execution,
-                    kind="error",
+                    kind="final_output",
                     llm_text=reply.text,
-                    error_message="The model's final answer was not valid JSON.",
+                    tool_output=parsed,
                     duration_ms=duration_ms,
                 )
-                return _finish(
-                    db,
-                    execution,
-                    "failed",
-                    error_message="The model did not return valid JSON for its final answer.",
-                )
+                return _finish(db, execution, "completed", final_output=parsed)
 
-            # Does the answer match the shape the skill promised?
-            schema = version.output_schema or {}
-            if schema:
-                try:
-                    jsonschema.validate(instance=parsed, schema=schema)
-                except jsonschema.ValidationError as exc:
-                    _record_step(
-                        db,
-                        execution,
-                        kind="error",
-                        llm_text=reply.text,
-                        error_message=f"Output did not match the schema: {exc.message}",
-                        duration_ms=duration_ms,
-                    )
-                    return _finish(
-                        db,
-                        execution,
-                        "failed",
-                        error_message=f"The final output did not match the output schema: {exc.message}",
-                    )
+            # The answer was unusable. Models routinely explain themselves in
+            # prose when they hit a wall, and throwing away an otherwise good
+            # run over formatting would be wasteful. So we tell the model what
+            # was wrong and let it try again - bounded, so one that simply
+            # cannot produce valid output does not loop until the step limit.
+            previous_attempts = sum(1 for s in execution.steps if s.kind == "invalid_output")
 
             _record_step(
                 db,
                 execution,
-                kind="final_output",
+                kind="invalid_output",
                 llm_text=reply.text,
-                tool_output=parsed,
+                model_content=reply.content,
+                error_message=problem,
                 duration_ms=duration_ms,
             )
-            return _finish(db, execution, "completed", final_output=parsed)
+
+            log_event(
+                agent_log,
+                "invalid_final_output",
+                execution_id=execution.id,
+                attempt=previous_attempts + 1,
+            )
+
+            if previous_attempts + 1 >= MAX_OUTPUT_CORRECTIONS:
+                return _finish(
+                    db,
+                    execution,
+                    "failed",
+                    error_message=(
+                        "The model could not produce output matching this skill's output "
+                        f"schema after {MAX_OUTPUT_CORRECTIONS} attempts. Last problem: {problem}"
+                    ),
+                )
+
+            continue
 
         # --- the model asked for a tool ---
         tool_name = reply.tool_name
@@ -415,6 +461,7 @@ def run_execution(db: Session, execution: models.Execution) -> models.Execution:
                 llm_text=reply.text,
                 tool_name=tool_name,
                 tool_input=tool_args,
+                model_content=reply.content,
                 error_message=reason,
                 duration_ms=duration_ms,
             )
@@ -429,6 +476,7 @@ def run_execution(db: Session, execution: models.Execution) -> models.Execution:
                 llm_text=reply.text,
                 tool_name=tool_name,
                 tool_input=tool_args,
+                model_content=reply.content,
                 duration_ms=duration_ms,
             )
 
@@ -484,6 +532,7 @@ def run_execution(db: Session, execution: models.Execution) -> models.Execution:
             tool_name=tool_name,
             tool_input=tool_args,
             tool_output=output,
+            model_content=reply.content,
             error_message=error,
             duration_ms=tool_ms,
         )

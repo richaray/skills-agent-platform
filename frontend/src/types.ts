@@ -45,7 +45,7 @@ export interface Problem {
 export interface ExecutionStep {
   id: number;
   step_number: number;
-  kind: "llm_call" | "tool_call" | "approval" | "final_output" | "error";
+  kind: "llm_call" | "tool_call" | "approval" | "final_output" | "invalid_output" | "error";
   llm_text: string | null;
   tool_name: string | null;
   tool_input: Record<string, any> | null;

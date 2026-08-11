@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.config import GEMINI_API_KEY, model_chain
 from app.logging_setup import agent_log, log_event
 from app.tools import TOOLS
 
@@ -26,6 +26,11 @@ API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 # (rate limit, provider hiccup). Permanent errors are not retried.
 MAX_ATTEMPTS = 3
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# Wait between retries of a temporary server-side failure. A 429 is handled
+# differently: the free tier's quota is per day, so waiting is pointless and we
+# switch to the next model in the chain instead.
+SERVER_ERROR_BACKOFF_SECONDS = 2
 
 
 class LLMError(Exception):
@@ -45,6 +50,9 @@ class LLMResponse:
     tool_name: str | None
     tool_args: dict
     raw: dict
+    # The model's reply exactly as the provider sent it. Stored and replayed
+    # unchanged on the next turn - see models.py for why that matters.
+    content: dict | None = None
 
 
 def build_tool_declarations(allowed_tool_names: list[str]) -> list[dict]:
@@ -78,25 +86,56 @@ def _parse_response(payload: dict) -> LLMResponse:
         feedback = payload.get("promptFeedback", {})
         raise LLMError(f"The model returned no answer. Provider feedback: {feedback}")
 
-    parts = candidates[0].get("content", {}).get("parts") or []
+    content = candidates[0].get("content", {}) or {}
+    parts = content.get("parts") or []
 
     text_pieces: list[str] = []
     tool_name: str | None = None
     tool_args: dict = {}
+    call_count = 0
 
     for part in parts:
         if "text" in part:
             text_pieces.append(part["text"])
         elif "functionCall" in part:
-            call = part["functionCall"]
-            tool_name = call.get("name")
-            tool_args = call.get("args") or {}
+            call_count += 1
+            # We act on one tool call per turn. If the model ever asks for
+            # several at once we take the first and log it, rather than
+            # silently dropping the others.
+            if tool_name is None:
+                call = part["functionCall"]
+                tool_name = call.get("name")
+                tool_args = call.get("args") or {}
+
+    # Gemini sometimes asks for several tools at once. The API then requires one
+    # functionResponse for every functionCall in that turn, and if the counts do
+    # not match it replies with an empty completion and no error - which is very
+    # hard to debug.
+    #
+    # We run one tool per step, so we normalise the turn down to its first call
+    # before storing it. The conversation we replay is then self-consistent:
+    # one call, one response. The dropped calls are not lost - the model simply
+    # asks for them again on the next turn if it still needs them.
+    if call_count > 1:
+        first_call_part = next(part for part in parts if "functionCall" in part)
+        content = {"role": "model", "parts": [first_call_part]}
+        log_event(
+            agent_log,
+            "trimmed_parallel_tool_calls",
+            requested=call_count,
+            kept=tool_name,
+        )
+
+    # Responses are matched to calls by tool name, which is sufficient because
+    # there is only ever one call per turn.
+    content.setdefault("role", "model")
 
     return LLMResponse(
         text="\n".join(text_pieces).strip(),
         tool_name=tool_name,
         tool_args=tool_args,
         raw=payload,
+        content=content,
     )
 
 
@@ -126,71 +165,97 @@ def call_llm(
     if declarations:
         body["tools"] = [{"function_declarations": declarations}]
 
-    url = f"{API_ROOT}/{GEMINI_MODEL}:generateContent"
-    last_error: str = ""
+    chain = model_chain()
+    quota_exhausted: list[str] = []
+    last_error = ""
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        started = time.monotonic()
-        try:
-            response = httpx.post(
-                url,
-                params={"key": GEMINI_API_KEY},
-                json=body,
-                timeout=60.0,
-            )
-        except httpx.RequestError as exc:
-            # Network-level problem: worth retrying.
-            last_error = f"Could not reach the model provider: {exc}"
+    for model in chain:
+        url = f"{API_ROOT}/{model}:generateContent"
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            started = time.monotonic()
+
+            try:
+                response = httpx.post(
+                    url, params={"key": GEMINI_API_KEY}, json=body, timeout=60.0
+                )
+            except httpx.RequestError as exc:
+                # A network problem is temporary and not the model's fault, so
+                # we retry the same model rather than moving on.
+                last_error = f"Could not reach the AI provider: {exc}"
+                log_event(agent_log, "llm_network_error", model=model, attempt=attempt)
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(SERVER_ERROR_BACKOFF_SECONDS * attempt)
+                    continue
+                break
+
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+            if response.status_code == 200:
+                log_event(
+                    agent_log,
+                    "llm_call_ok",
+                    model=model,
+                    attempt=attempt,
+                    duration_ms=elapsed_ms,
+                    fell_back=model != chain[0],
+                )
+                return _parse_response(response.json())
+
+            # Daily quota gone for this model. Waiting will not help - it resets
+            # tomorrow - so move straight to the next model in the chain.
+            if response.status_code == 429:
+                quota_exhausted.append(model)
+                last_error = "The AI provider's free quota is exhausted for this model."
+                log_event(
+                    agent_log,
+                    "llm_quota_exhausted",
+                    model=model,
+                    duration_ms=elapsed_ms,
+                    remaining_models=len(chain) - len(quota_exhausted),
+                )
+                break
+
+            # The model name is gone. Nothing to retry; try the next one.
+            if response.status_code == 404:
+                last_error = f"The model '{model}' is no longer available."
+                log_event(agent_log, "llm_model_unavailable", model=model)
+                break
+
+            # A temporary server-side problem: retry the same model.
+            if response.status_code in RETRY_STATUS_CODES:
+                last_error = f"The AI provider returned {response.status_code}."
+                log_event(
+                    agent_log,
+                    "llm_server_error",
+                    model=model,
+                    status_code=response.status_code,
+                    attempt=attempt,
+                )
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(SERVER_ERROR_BACKOFF_SECONDS * attempt)
+                    continue
+                break
+
+            # Anything else is our fault (bad key, malformed request). Retrying
+            # or switching models will not help, so stop with a clear message.
             log_event(
                 agent_log,
-                "llm_call_failed",
-                attempt=attempt,
-                reason="network",
-                error=str(exc),
-            )
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(attempt)  # 1s, then 2s
-                continue
-            raise LLMError(last_error) from exc
-
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-
-        if response.status_code in RETRY_STATUS_CODES:
-            last_error = f"Provider returned {response.status_code}: {response.text[:300]}"
-            log_event(
-                agent_log,
-                "llm_call_retryable_error",
-                attempt=attempt,
+                "llm_request_rejected",
+                model=model,
                 status_code=response.status_code,
-                duration_ms=elapsed_ms,
-            )
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(attempt)
-                continue
-            raise LLMError(last_error)
-
-        if response.status_code != 200:
-            # A permanent error (bad key, malformed request). Retrying will not
-            # help, so fail immediately with a message a human can act on.
-            log_event(
-                agent_log,
-                "llm_call_failed",
-                attempt=attempt,
-                status_code=response.status_code,
-                duration_ms=elapsed_ms,
             )
             raise LLMError(
-                f"Model provider rejected the request ({response.status_code}): "
+                f"The AI provider rejected the request ({response.status_code}): "
                 f"{response.text[:300]}"
             )
 
-        log_event(
-            agent_log,
-            "llm_call_ok",
-            attempt=attempt,
-            duration_ms=elapsed_ms,
-            model=GEMINI_MODEL,
+    if len(quota_exhausted) == len(chain):
+        raise LLMError(
+            "Every configured AI model has used up its free daily quota. "
+            "Google's free tier allows only a limited number of requests per model "
+            "per day, and it resets at midnight Pacific time. Everything else in the "
+            "app still works - only running a skill is unavailable."
         )
-        return _parse_response(response.json())
 
-    raise LLMError(last_error or "The model could not be reached.")
+    raise LLMError(last_error or "The AI provider could not be reached.")
