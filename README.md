@@ -183,6 +183,34 @@ one task on approval, and created **no** second task when approved again.
 
 ---
 
+## Logs
+
+Every log line is a single JSON object. That matters here because the
+interesting events are about an AI workflow — *which tool did step 3 call, and
+was it refused* — and those read far better as structured fields than as
+sentences. There are two loggers: `app` for web events and `agent` for the AI
+workflow.
+
+A complete run, including a refused tool call and an approval, looks like this:
+
+```json
+{"time":"...","level":"INFO","logger":"agent","message":"tool_refused","execution_id":1,"tool":"document_search","reason":"not_allowed"}
+{"time":"...","level":"INFO","logger":"agent","message":"tool_call","execution_id":1,"tool":"calculator","ok":true,"duration_ms":0}
+{"time":"...","level":"INFO","logger":"agent","message":"approval_requested","execution_id":1,"tool":"create_task","step":3}
+{"time":"...","level":"INFO","logger":"agent","message":"approval_granted","execution_id":1,"tool":"create_task","ok":true}
+{"time":"...","level":"INFO","logger":"agent","message":"execution_finished","execution_id":1,"status":"completed","steps_used":4}
+{"time":"...","level":"INFO","logger":"app","message":"http_request","method":"GET","path":"/api/skills","status_code":200,"duration_ms":15}
+```
+
+Other events worth knowing about: `llm_call_ok` (with `fell_back` when a backup
+model was used), `llm_quota_exhausted`, `llm_model_unavailable`,
+`trimmed_parallel_tool_calls`, `invalid_final_output`, `approval_rejected`,
+`approval_replay_ignored` (a duplicate approval that was correctly ignored), and
+`version_published`.
+
+Logs go to stdout, which is where Docker and Render collect them. In production
+they are under **Logs** in the Render dashboard.
+
 ## Demo walkthrough
 
 The seeded skill is **Refund Eligibility Assessor**, which ships with two
